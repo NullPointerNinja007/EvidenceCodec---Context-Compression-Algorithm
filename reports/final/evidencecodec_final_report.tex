@@ -1,6 +1,6 @@
 \documentclass[10pt,twocolumn]{article}
 
-\usepackage[margin=0.65in]{geometry}
+\usepackage[margin=0.7in]{geometry}
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{array}
@@ -8,62 +8,135 @@
 \usepackage{caption}
 \usepackage{subcaption}
 \usepackage{enumitem}
+\usepackage{amsmath}
 
 \setlist{nosep,leftmargin=*}
 \captionsetup{font=small}
 \setlength{\columnsep}{0.22in}
 
-\title{\vspace{-0.35in}\textbf{EvidenceCodec: Query-Conditioned Token Compression for Evidence Preservation}}
-\author{
-Maleeka Raddygala\\
-\href{mailto:maleeka@stanford.edu}{maleeka@stanford.edu}\\
+\title{\vspace{-0.45in}
+\normalsize Maleeka Raddygala\\
+\small \href{mailto:maleeka@stanford.edu}{maleeka@stanford.edu}\\
 \small Token Compression Challenge, The Token Company\\
-\small GitHub: \href{https://github.com/NullPointerNinja007/EvidenceCodec---Context-Compression-Algorithm}{github.com/NullPointerNinja007/EvidenceCodec---Context-Compression-Algorithm}
-}
+\small GitHub: \href{https://github.com/NullPointerNinja007/EvidenceCodec---Context-Compression-Algorithm}{github.com/NullPointerNinja007/EvidenceCodec---Context-Compression-Algorithm}\\[0.12in]
+\Large\textbf{EvidenceCodec: Query-Conditioned Evidence Selection for Token Compression}}
+\author{}
 \date{June 21, 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-EvidenceCodec is a raw-text context compression pipeline for long-context question answering. Instead of summarizing, it selects the most answer-critical evidence chunks under a token budget. The implemented system uses deterministic chunking, high-recall hybrid candidate generation, a ModernBERT-large cross-encoder reranker, and budgeted selection with a deterministic RiskGuard add-back layer. In a time-boxed HotpotQA training run, the reranker improved EvidenceRecall@Budget from 0.701 at step 50 to 0.872 at step 300, while AllGoldSelected@Budget improved from 0.484 to 0.759.
+EvidenceCodec is a query-conditioned token compression system designed to reduce long input contexts while preserving answer-critical evidence. The core design choice is to avoid abstractive summarization and instead select raw text chunks that can be passed directly to a downstream model. The implemented pipeline combines deterministic structure-preserving chunking, high-recall hybrid candidate generation, ModernBERT-large cross-encoder reranking, and budgeted evidence selection with a deterministic RiskGuard safety layer. In a few-hour challenge setting, full HotpotQA training artifacts were built with parallel Modal CPU workers, and a time-boxed ModernBERT-large run produced six checkpoints. On a 1,000-example HotpotQA validation slice, EvidenceRecall@Budget improved from 0.701 at step 50 to 0.872 at step 300, while AllGoldSelected@Budget improved from 0.484 to 0.759. These results show that the architecture reached a strong initial evidence-selection baseline despite limited training time.
 \end{abstract}
 
-\section{Problem and Goal}
-The challenge is to reduce prompt length while preserving the evidence needed for downstream answering. The main failure mode is silent evidence loss: the compressed context looks plausible but omits a number, exception, negation, date, or relation needed for the answer.
+\section{Introduction}
+Long-context systems often waste tokens on material that is not needed for a specific query. A token compression method should therefore do more than shorten text; it should preserve the information required to answer the question. For evidence-heavy tasks, the critical failure mode is silent evidence loss. A compressed context may look fluent and relevant while omitting a date, negation, exception, quantity, named entity relation, or other small fact that changes the answer.
 
-The goal of EvidenceCodec is therefore not abstractive compression. The system outputs selected raw text spans. This keeps provenance clear and makes it easier to audit which evidence was retained.
+EvidenceCodec addresses this by treating compression as evidence selection. Given a query $q$ and a long context $D$, the system chooses a subset of raw text chunks $S \subset D$ under a token budget $B$. The compressed output is not a summary. It is a stitched set of original text spans selected because they are likely to contain answer-supporting evidence.
 
-\section{High-Level Architecture}
-The pipeline is:
+This report describes the implemented architecture, the training and evaluation run, and the final metrics. The work was completed under a tight challenge deadline of only a few hours. Because of that constraint, the system was engineered to reach a working end-to-end result quickly: full artifacts were built, the reranker was trained for 300 optimizer steps, six checkpoints were saved, every checkpoint was evaluated, and metric plots were generated. The run did not have enough time for a full epoch, QASPER adaptation, or LongBench evaluation.
 
-\begin{center}
-\fbox{\begin{minipage}{0.93\linewidth}
+\section{System Objective}
+The target behavior is query-conditioned compression:
+\[
+f(q, D, B) \rightarrow C,
+\]
+where $q$ is the user question, $D$ is the original long context, $B$ is the output token budget, and $C$ is the selected compressed context. The system should maximize evidence retention under budget, not semantic smoothness.
+
+The practical objectives were:
+\begin{enumerate}
+\item keep the output auditable by preserving raw text;
+\item maximize recall of gold supporting evidence in the candidate pool;
+\item train a reranker that ranks true evidence above distractors;
+\item select high-utility evidence under a strict token budget;
+\item expose metrics that show how quality changes with training step.
+\end{enumerate}
+
+\section{Architecture Overview}
+Figure~\ref{fig:architecture} gives the high-level system architecture. The pipeline is deliberately modular: each stage has a narrow responsibility and produces inspectable artifacts.
+
+\begin{figure*}[t]
 \centering
-Raw context + query\\
-$\downarrow$\\
-Structure-preserving chunker\\
-$\downarrow$\\
-Stage-1 candidate generator: BM25 + dense cosine + risk prior\\
-$\downarrow$\\
-ModernBERT-large cross-encoder reranker\\
-$\downarrow$\\
-Budgeted selector + RiskGuard add-back\\
-$\downarrow$\\
-Compressed raw-text context
+\fbox{\begin{minipage}{0.95\textwidth}
+\centering
+\textbf{Input: query + long context}\\[0.05in]
+$\Downarrow$\\[-0.02in]
+\textbf{Structure-preserving chunker}\\
+paragraphs, headings, tables, local overlap, token accounting\\[0.05in]
+$\Downarrow$\\[-0.02in]
+\textbf{Stage-1 candidate generation}\\
+BM25 lexical score + frozen dense cosine score + fragile-evidence risk prior + reciprocal-rank fusion\\[0.05in]
+$\Downarrow$\\[-0.02in]
+\textbf{ModernBERT-large cross-encoder reranker}\\
+scores each $(q, x_i)$ query-chunk pair for evidence usefulness\\[0.05in]
+$\Downarrow$\\[-0.02in]
+\textbf{Budgeted selector + RiskGuard}\\
+utility-per-token selection, redundancy control, deterministic add-back for high-risk dropped chunks\\[0.05in]
+$\Downarrow$\\[-0.02in]
+\textbf{Output: compressed raw-text evidence context}
 \end{minipage}}
-\end{center}
+\caption{EvidenceCodec architecture. The system compresses by selecting raw evidence spans rather than generating summaries.}
+\label{fig:architecture}
+\end{figure*}
 
-\textbf{Chunking.} Documents are split into deterministic raw-text chunks while preserving paragraphs, headings, table-like units, and local context where possible.
+\subsection{Chunking}
+The chunker converts a long document into deterministic raw-text units. It is designed to preserve structure before falling back to token-based splitting. In practice, it respects paragraphs and section-like units, tracks token counts, and avoids splitting across boundaries that are likely to contain important local modifiers such as ``unless,'' ``not,'' or exception clauses.
 
-\textbf{Candidate generation.} Stage 1 uses BM25, a frozen dense similarity score, and a risk prior. These are fused into a high-recall candidate pool with cap $k=256$.
+This stage is intentionally not learned. Deterministic chunking makes the rest of the pipeline reproducible and makes labels easier to project from supporting-fact annotations. The output of this stage is a JSONL record per query/document example containing chunk ids, raw text, token counts, metadata, and gold labels when available.
 
-\textbf{Reranking.} A ModernBERT-large cross-encoder scores query-chunk pairs. The scalar score estimates whether a chunk is useful evidence.
+\subsection{Stage-1 Candidate Generation}
+Stage 1 is a high-recall retrieval step. It is not expected to make the final compression decision. Its job is to keep likely evidence in the pool so the reranker and selector can operate on a smaller candidate set.
 
-\textbf{Selection.} The final selector chooses chunks under a token budget by utility per token, with a small redundancy penalty. RiskGuard can add back high-risk dropped chunks if they clear relevance and risk thresholds.
+Each chunk receives:
+\begin{itemize}
+\item a BM25 lexical score;
+\item a frozen dense cosine-like similarity score;
+\item a risk prior for fragile evidence patterns such as numbers, dates, negations, and exception language.
+\end{itemize}
 
-\section{Implementation and Run Setup}
-All large data and model artifacts were stored in isolated Modal volumes, not in the local repository. CPU preprocessing was sharded across up to 100 Modal containers. GPU training and evaluation used B200 instances.
+The ranked lists are fused with reciprocal-rank fusion and capped at $k=256$. On the validation slice used in this run, Recall@32, Recall@64, and Recall@128 were all 1.000 for every checkpoint evaluation. This indicates that Stage 1 was not the bottleneck on this slice; the harder problem was ordering and budgeted selection.
+
+\subsection{Cross-Encoder Reranking}
+The reranker is a ModernBERT-large cross-encoder over query-chunk pairs. Each input is packed as a pair sequence:
+\[
+\texttt{[CLS] query [SEP] chunk [SEP]}.
+\]
+The final hidden state at the first token is passed through a scalar classification head. The model is trained to output a high score for chunks containing gold supporting evidence.
+
+This design is more expensive than independent embedding retrieval, but it is appropriate for the quality path because the candidate pool is already capped. A cross-encoder can directly model interactions between the query and the chunk text, including relational clues that are hard to capture with independent embeddings.
+
+\subsection{Training Objective}
+The training objective combines binary evidence classification with a same-query pairwise margin loss. For each query group, positives are gold evidence chunks and negatives are high-ranked non-gold candidate chunks. The loss is:
+\[
+L = L_{\mathrm{BCE}} + \lambda L_{\mathrm{rank}},
+\]
+where $\lambda=0.5$ in the run. The margin loss encourages positive chunks to score above negative chunks from the same query group. This matters because compression quality depends on relative ordering under a budget, not only calibrated probabilities.
+
+\subsection{Budgeted Selection and RiskGuard}
+After reranking, the selector chooses chunks under a token budget. The priority is approximately:
+\[
+\frac{\mathrm{utility}(x_i)}{\mathrm{tokens}(x_i)^\alpha},
+\]
+with $\alpha=0.9$. A small redundancy penalty reduces repeated content. The selected chunks are then sorted back into document order so the output remains readable.
+
+RiskGuard is a deterministic safety layer after budget selection. It can add back dropped chunks when both relevance and risk exceed thresholds. In the evaluation run, RiskGuard did not activate: avg risk-added chunks was 0.0 at all checkpoints. This does not invalidate the component; it means the HotpotQA validation slice did not trigger the configured add-back conditions. A separate stress evaluation is needed for dates, quantities, negations, and exception-heavy policy examples.
+
+\section{Engineering and Artifact Pipeline}
+The implementation was designed around Modal volumes and parallel jobs. Large datasets, processed artifacts, checkpoints, and evaluation outputs were not stored as local training data. They were stored in isolated Modal volumes:
+\begin{itemize}
+\item \texttt{/data} for raw and processed datasets;
+\item \texttt{/models} for ModernBERT checkpoints;
+\item \texttt{/runs} for evaluation metrics and plots;
+\item \texttt{/cache} for Hugging Face and model caches.
+\end{itemize}
+
+CPU preprocessing was parallelized across up to 100 containers. Each worker built a shard containing both chunk records and Stage-1 candidate records. This avoided a second pass over the full merged chunk file and allowed preprocessing to complete quickly enough for the challenge window.
+
+Training and checkpoint evaluation used B200 GPUs. The trainer saved six checkpoints at steps 50, 100, 150, 200, 250, and 300. After training, each checkpoint was evaluated and the metric curves were written to JSONL, CSV, and PNG plots.
+
+\section{Experimental Setup}
+Table~\ref{tab:setup} summarizes the completed run.
 
 \begin{table}[h]
 \centering
@@ -85,16 +158,26 @@ Effective batch size & 128 pairs\\
 Optimizer & AdamW\\
 Learning rate & 2e-5\\
 Training budget & 300 optimizer steps\\
-Checkpoints & steps 50, 100, 150, 200, 250, 300\\
+Checkpoints & 6 checkpoints\\
 \bottomrule
 \end{tabular}
 \caption{Run configuration.}
+\label{tab:setup}
 \end{table}
 
-The 300-step run was chosen because the available time was about one hour. A full epoch would be about 8,006 optimizer steps, so this was a fast but meaningful partial training run over the full prepared artifact set.
+A full epoch would have required about 8,006 optimizer steps. The completed 300-step run therefore covered only about 3.7 percent of one epoch. This was an intentional time-boxed decision: the goal was to produce a complete trained baseline, checkpoint curve, and report within a few hours rather than to exhaust the dataset.
+
+\section{Evaluation Metrics}
+The report uses two classes of metrics.
+
+\textbf{Reranking metrics.} MRR@10 and nDCG@10 measure whether gold evidence is ranked near the top. Recall@32, Recall@64, and Recall@128 measure whether gold evidence remains recoverable in the top candidate set.
+
+\textbf{Compression metrics.} EvidenceRecall@Budget measures the fraction of gold evidence chunks retained after budgeted selection. AllGoldSelected@Budget measures the stricter event that every gold chunk for an example survives compression. Average selected tokens and selected chunk count describe the compression behavior.
+
+The most important metric for this system is EvidenceRecall@Budget, because the system's output is the selected compressed context that will be given to a downstream model.
 
 \section{Results}
-The run was successful for a time-boxed challenge setting. The model learned quickly and the main evidence-selection metrics improved sharply between steps 50 and 150, then plateaued.
+Table~\ref{tab:results} shows the checkpoint metrics. The model improved quickly from step 50 to step 150 and then plateaued.
 
 \begin{table*}[t]
 \centering
@@ -112,31 +195,12 @@ Step & MRR@10 & nDCG@10 & Recall@32 & EvidenceRecall@Budget & AllGoldSelected@Bu
 \bottomrule
 \end{tabular}
 \caption{Checkpoint metrics on 1,000 HotpotQA validation examples. Recall@64 and Recall@128 were also 1.000 at every checkpoint.}
+\label{tab:results}
 \end{table*}
 
-The most useful checkpoint depends on the objective. Step 250 had the best reranking metrics, with MRR@10 of 0.930 and nDCG@10 of 0.895. Step 300 had the best compressed-context evidence metrics, with EvidenceRecall@Budget of 0.872 and AllGoldSelected@Budget of 0.759. For the compressor, step 300 is the recommended checkpoint.
+From step 50 to step 300, MRR@10 improved from 0.760 to 0.928, a 22.2 percent relative gain. nDCG@10 improved from 0.769 to 0.895, a 16.4 percent relative gain. EvidenceRecall@Budget improved from 0.701 to 0.872, a 24.5 percent relative gain. AllGoldSelected@Budget improved from 0.484 to 0.759, a 56.8 percent relative gain.
 
-Training loss also moved in the right direction. Comparing the first 50 and last 50 optimizer steps of the completed run, total loss dropped by about 50.8 percent, BCE loss by about 49.5 percent, and ranking loss by about 57.8 percent.
-
-\section{Interpretation}
-The strongest result is that the Stage-1 candidate pool had complete coverage on this validation slice: Recall@32, Recall@64, and Recall@128 were all 1.000. That means the main bottleneck was ranking and budgeted selection, not initial retrieval.
-
-The reranker improved quickly. MRR@10 rose from 0.760 to 0.928, and nDCG@10 rose from 0.769 to 0.895. Budgeted evidence preservation improved even more: AllGoldSelected@Budget rose from 0.484 to 0.759. This is a large practical gain because it measures whether all annotated evidence survived compression.
-
-The plateau after about step 150 suggests that the first 300 steps were enough to learn a strong initial ranking function, but not enough to fully exhaust the data. Since the run used only a small fraction of a full epoch, a longer run may still improve robustness, especially on harder examples.
-
-\section{Limitations and Next Steps}
-This report covers a fast HotpotQA run, not a complete benchmark suite. The run used 300 optimizer steps out of roughly 8,006 steps in one full epoch. Evaluation used a fixed 1,000-example HotpotQA validation slice. QASPER, LongBench, and full-validation evaluation remain future work.
-
-RiskGuard did not activate in this validation slice; avg risk-added chunks was 0.0 at every checkpoint. This does not mean RiskGuard is unnecessary. It means a separate stress set with dates, numbers, negations, and exception-heavy examples is needed to measure that component.
-
-Recommended next steps are:
-\begin{enumerate}
-\item Evaluate checkpoint step 300 on full HotpotQA validation.
-\item Run QASPER adaptation or evaluation for scientific-document evidence selection.
-\item Run a longer 1,000 to 2,000 step training run if more B200 time is available.
-\item Add a targeted RiskGuard stress test.
-\end{enumerate}
+The best reranking checkpoint was step 250, with MRR@10 of 0.930 and nDCG@10 of 0.895. The best compression checkpoint was step 300, with EvidenceRecall@Budget of 0.872 and AllGoldSelected@Budget of 0.759. Since the deployed compressor cares most about retained evidence under budget, step 300 is the recommended checkpoint.
 
 \begin{figure*}[t]
 \centering
@@ -170,9 +234,30 @@ Recommended next steps are:
 \includegraphics[width=\linewidth]{assets/plots/avg_risk_added.png}
 \end{subfigure}
 \caption{Metric curves across the six saved checkpoints.}
+\label{fig:metrics}
 \end{figure*}
 
+\section{Analysis}
+The results show three important patterns.
+
+\textbf{Candidate recall was solved on the validation slice.} Recall@32, Recall@64, and Recall@128 were all 1.000. This is exactly what Stage 1 is supposed to accomplish. It means the gold evidence was usually present before reranking and selection, so failures were not caused by the retrieval stage dropping evidence too early.
+
+\textbf{The reranker learned rapidly.} The biggest jump happened between steps 50 and 100. MRR@10 moved from 0.760 to 0.901, and EvidenceRecall@Budget moved from 0.701 to 0.834. This suggests that ModernBERT-large is well matched to the pairwise evidence selection task and can learn useful ranking behavior quickly.
+
+\textbf{The budgeted selector became more efficient.} Average selected chunks decreased from 5.15 to 4.76 while EvidenceRecall@Budget increased. The system was not merely selecting more text. It was selecting better text. Average used tokens increased only modestly from 411 to 422, while all-gold coverage improved by 27.5 absolute percentage points.
+
+Training losses support the same conclusion. Comparing the first 50 and last 50 optimizer steps of the completed 300-step run, total loss dropped by about 50.8 percent, BCE loss by about 49.5 percent, and ranking loss by about 57.8 percent. Both the classifier and the pairwise ranking objective were improving.
+
+\section{Limitations}
+The main limitation is training time. The project only had a few hours for implementation, artifact generation, training, evaluation, graphing, and reporting. The final run was capped at 300 optimizer steps so that it could produce at least five checkpoints, evaluate all checkpoints, and render plots before the deadline. A full epoch would be about 8,006 optimizer steps, so this run did not train long enough to claim convergence.
+
+The evaluation was also limited to a 1,000-example HotpotQA validation slice. This is enough to show that the pipeline works and that training improved the model, but it is not a complete benchmark. Full HotpotQA validation, QASPER, and LongBench should be run before making broader claims.
+
+Finally, RiskGuard did not activate on this validation slice. The implementation exists, but the reported slice did not stress the kinds of fragile facts RiskGuard is meant to protect. A dedicated stress set with numbers, dates, negations, legal/policy exceptions, and code identifiers is needed.
+
 \section{Conclusion}
-EvidenceCodec reached a useful working baseline within the time limit. The system built full HotpotQA artifacts, trained ModernBERT-large checkpoints, evaluated every checkpoint, and produced metric curves. The final checkpoint preserved 87.2 percent of annotated evidence under budget and selected all annotated gold evidence for 75.9 percent of validation examples. For a short run, this is a strong result and a good foundation for longer training and broader evaluation.
+EvidenceCodec produced a working evidence-preserving token compression pipeline under a tight challenge deadline. The architecture successfully separated recall, semantic reranking, and budgeted selection. The completed run built full HotpotQA artifacts, trained ModernBERT-large on the full artifact set for a capped 300 steps, saved six checkpoints, evaluated all checkpoints, and generated metric plots.
+
+The final checkpoint retained 87.2 percent of annotated evidence under budget and selected all gold evidence for 75.9 percent of validation examples. Given that this was only 3.7 percent of a full epoch, the result is a strong baseline rather than a final ceiling. With more time, the next step would be longer training followed by full validation and cross-domain evaluation.
 
 \end{document}
