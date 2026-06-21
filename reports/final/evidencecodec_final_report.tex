@@ -9,10 +9,12 @@
 \usepackage{subcaption}
 \usepackage{enumitem}
 \usepackage{amsmath}
+\usepackage{microtype}
 
 \setlist{nosep,leftmargin=*}
 \captionsetup{font=small}
 \setlength{\columnsep}{0.22in}
+\setcounter{secnumdepth}{0}
 
 \title{\vspace{-0.45in}
 \normalsize Maleeka Raddygala\\
@@ -126,7 +128,11 @@ The dataset adapters make the chunker exact enough for supervision:
 \subsection{Stage-1 Candidate Generation}
 Stage 1 is designed for recall. It deliberately uses rank fusion instead of treating BM25, dense similarity, and risk scores as if they were calibrated to the same scale.
 
-BM25 tokenization uses the regex \verb|[A-Za-z0-9_.$%/-]+|; this preserves useful code-like and number-like tokens. Dense scoring has two interchangeable backends. The fast deterministic backend is a normalized hashing vectorizer with 4,096 features and character word-boundary n-grams of length 3 to 5. The semantic backend is a frozen sentence-transformer scorer using \texttt{BAAI/bge-small-en-v1.5}. Both return cosine-like scores.
+BM25 tokenization uses a retrieval pattern designed to preserve useful code-like and number-like tokens:
+\begin{center}
+\small\verb|[A-Za-z0-9_.$%/-]+|
+\end{center}
+Dense scoring has two interchangeable backends. The fast deterministic backend is a normalized hashing vectorizer with 4,096 features and character word-boundary n-grams of length 3 to 5. The semantic backend is a frozen sentence-transformer scorer using \texttt{BAAI/bge-small-en-v1.5}. Both return cosine-like scores.
 
 For every query and chunk list, the implementation computes raw BM25, raw dense, and raw risk scores, then min-max normalizes them within the query. A diagnostic hybrid score is stored:
 \[
