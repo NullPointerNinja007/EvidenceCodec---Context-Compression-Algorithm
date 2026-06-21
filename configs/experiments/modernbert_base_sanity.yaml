@@ -1,0 +1,28 @@
+inherits: configs/default.yaml
+
+run:
+  name: modernbert-base-sanity
+
+datasets:
+  pretrain:
+    name: hotpotqa
+    split: train[:2000]
+  eval:
+    - name: hotpotqa
+      split: validation[:500]
+
+training:
+  model_name: answerdotai/ModernBERT-base
+  epochs: 1
+  learning_rate: 0.00002
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  effective_batch_size: 64
+  precision: bf16
+  losses:
+    bce_weight: 1.0
+    ranking_weight: 0.5
+    margin: 0.2
+  negatives:
+    bm25_hard_per_positive: 4
+    random_per_positive: 4

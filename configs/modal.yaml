@@ -1,0 +1,24 @@
+app_name: evidence-codec
+
+volumes:
+  data: evidencecodec-ccalg-20260621-data
+  models: evidencecodec-ccalg-20260621-models
+  runs: evidencecodec-ccalg-20260621-runs
+  cache: evidencecodec-ccalg-20260621-cache
+
+mounts:
+  data: /data
+  models: /models
+  runs: /runs
+  cache: /cache
+
+gpu:
+  main_training: B200:4
+  ablation: B200:2
+  serving_quality: B200
+
+timeouts_seconds:
+  ingest: 14400
+  train: 21600
+  evaluate: 14400
+  serve: 600

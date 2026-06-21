@@ -1,0 +1,24 @@
+{
+  "status": "ok",
+  "run_name": "modernbert-large-hotpotqa-full",
+  "checkpoint_dir": "/models/rerankers/modernbert-large-hotpotqa-full",
+  "checkpoints": [
+    "/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000050",
+    "/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000100",
+    "/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000150",
+    "/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000200",
+    "/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000250",
+    "/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000300"
+  ],
+  "checkpoint_count": 6,
+  "chunk_jsonl": "/data/processed/chunks/hotpotqa/train.jsonl",
+  "candidate_jsonl": "/data/processed/candidates/hotpotqa/train.k256.jsonl",
+  "pairs": 1069179,
+  "optimizer_steps": 300,
+  "total_steps": 300,
+  "microbatch_steps": 3387,
+  "effective_batch_size": 128,
+  "microbatches_per_epoch": 90447,
+  "optimizer_steps_per_epoch": 8006,
+  "train_metrics_path": "/models/rerankers/modernbert-large-hotpotqa-full/train_metrics.jsonl"
+}

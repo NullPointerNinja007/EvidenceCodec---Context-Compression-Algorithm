@@ -1,0 +1,50 @@
+project:
+  name: evidence-codec
+  seed: 1337
+
+chunking:
+  target_tokens: 160
+  soft_max_tokens: 192
+  hard_max_tokens: 224
+  overlap_tokens: 32
+  query_max_tokens: 96
+  pair_max_tokens: 512
+  preserve_units:
+    - headings
+    - paragraphs
+    - bullet_items
+    - table_rows
+    - code_blocks
+    - equations
+    - captions
+
+retrieval:
+  bm25_top_k: 96
+  dense_top_k: 96
+  risk_top_k: 32
+  candidate_cap: 256
+  rrf_c: 60
+  rrf_weights:
+    bm25: 1.0
+    dense: 1.0
+    risk: 0.75
+
+reranker:
+  model_name: answerdotai/ModernBERT-large
+  sequence_length: 512
+  query_max_tokens: 96
+  precision: bf16
+
+selection:
+  budget_tokens: 4096
+  length_exponent: 0.9
+  redundancy_penalty: 0.15
+  risk_addback_fraction: 0.10
+  relevance_threshold: 0.35
+  risk_threshold: 0.55
+
+modal:
+  data_mount: /data
+  models_mount: /models
+  runs_mount: /runs
+  cache_mount: /cache

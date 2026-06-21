@@ -1,0 +1,7 @@
+checkpoint,step,records,MRR@10,nDCG@10,Recall@32,Recall@64,Recall@128,EvidenceRecall@Budget,AllGoldSelected@Budget,avg_used_tokens,avg_selected_chunks,avg_risk_added
+/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000050,50,1000,0.7595813492063501,0.7687041182777344,1.0,1.0,1.0,0.7006666666666668,0.484,411.445,5.154,0.0
+/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000100,100,1000,0.9009492063492065,0.8696361506380532,1.0,1.0,1.0,0.8336666666666668,0.689,418.375,4.917,0.0
+/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000150,150,1000,0.9210361111111116,0.888068347041988,1.0,1.0,1.0,0.8671666666666666,0.751,422.09,4.793,0.0
+/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000200,200,1000,0.9269527777777784,0.892356964235103,1.0,1.0,1.0,0.8671666666666666,0.75,422.077,4.763,0.0
+/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000250,250,1000,0.929819444444445,0.8950832870152375,1.0,1.0,1.0,0.8696666666666666,0.755,422.062,4.766,0.0
+/models/rerankers/modernbert-large-hotpotqa-full/checkpoint-step-000300,300,1000,0.9282361111111116,0.8945795596191498,1.0,1.0,1.0,0.8721666666666666,0.759,422.088,4.761,0.0

@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# EvidenceCodec local spillover. Project data belongs in Modal Volumes.
+data/
+models/
+checkpoints/
+runs/
+artifacts/
+outputs/
+local_cache/
+wandb/
+mlruns/
