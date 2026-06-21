@@ -80,60 +80,266 @@ $\Downarrow$\\[-0.02in]
 \label{fig:architecture}
 \end{figure*}
 
-\subsection{Chunking}
-The chunker converts a long document into deterministic raw-text units. It is designed to preserve structure before falling back to token-based splitting. In practice, it respects paragraphs and section-like units, tracks token counts, and avoids splitting across boundaries that are likely to contain important local modifiers such as ``unless,'' ``not,'' or exception clauses.
+\subsection{Implementation Interfaces}
+The code is organized around three small data objects. A \texttt{Chunk} stores \texttt{chunk\_id}, raw \texttt{text}, \texttt{token\_count}, optional character offsets, breadcrumb headings, and metadata. A \texttt{Candidate} wraps a chunk with \texttt{retrieval\_score}, normalized \texttt{risk\_score}, optional \texttt{rerank\_score}, a source string, and a score dictionary. Its utility is the reranker score when available and the retrieval score otherwise. A \texttt{CompressionResult} stores the query, final compressed raw-text context, selected chunks, dropped chunks, and audit metrics.
 
-This stage is intentionally not learned. Deterministic chunking makes the rest of the pipeline reproducible and makes labels easier to project from supporting-fact annotations. The output of this stage is a JSONL record per query/document example containing chunk ids, raw text, token counts, metadata, and gold labels when available.
+This interface is important because each stage can be inspected independently. The chunker does not know about ModernBERT. Stage 1 does not know about optimizer state. The selector does not need to know whether utility came from the cross-encoder, the hybrid retrieval score, or a future cheap student. That makes it possible to run retrieval-only smoke tests, B200 quality mode, and offline evaluation with the same downstream selector.
 
-\subsection{Stage-1 Candidate Generation}
-Stage 1 is a high-recall retrieval step. It is not expected to make the final compression decision. Its job is to keep likely evidence in the pool so the reranker and selector can operate on a smaller candidate set.
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{p{0.23\textwidth}p{0.30\textwidth}p{0.38\textwidth}}
+\toprule
+Module & Main responsibility & Exact implementation detail\\
+\midrule
+\texttt{units.py} & Pack structure units into chunks & Greedy contiguous packing with target 160 tokens, soft max 192, hard max 224, and 32-token overlap.\\
+\texttt{dataset\_chunkers.py} & Dataset-specific units and labels & HotpotQA sentence units with title breadcrumbs; QASPER abstract, section paragraphs, and figure/table captions; LongBench paragraph units for evaluation.\\
+\texttt{stage1.py} & High-recall candidate pool & BM25 top 96, dense top 96, risk top 32, RRF cap 256 with $c=60$ and risk weight 0.75.\\
+\texttt{cross\_encoder.py} & ModernBERT-large scorer & Query max 96 tokens, pair length 512, bf16, final-layer CLS state, dropout 0.1, scalar linear head.\\
+\texttt{budget.py} & Budgeted selection & Greedy utility per token with $\alpha=0.9$ and Jaccard redundancy penalty 0.15.\\
+\texttt{risk\_addback.py} & Deterministic rescue & Eligible dropped chunks require utility $>=0.35$, risk $>=0.55$, and fit in a 10 percent add-back reserve.\\
+\texttt{checkpoint\_run.py} & Time-boxed full run & Resume-aware B200 training, six checkpoint schedule, parallel B200 checkpoint evaluation, CSV/JSONL/plot outputs.\\
+\bottomrule
+\end{tabular}
+\caption{Concrete architecture-to-code mapping. The Modal wrappers are intentionally thin and import these implementation modules rather than containing the main logic.}
+\label{tab:code-map}
+\end{table*}
 
-Each chunk receives:
+\subsection{Deterministic Chunking}
+The implemented chunker is hierarchical and conservative. It first converts input records into \texttt{TextUnit} objects. Each unit has text, a stable unit id, breadcrumb headings, metadata, and a \texttt{group\_key}. The packer then greedily groups adjacent units into chunks. It flushes the buffer when the structural group changes, when the hard token limit would be exceeded, or when the soft limit would be exceeded at a safe boundary.
+
+The default constants are:
+\[
+L_{\mathrm{target}}=160,\quad L_{\mathrm{soft}}=192,\quad L_{\mathrm{hard}}=224,\quad o=32.
+\]
+If an individual unit is too large, it is split by sentence boundaries. If sentence splitting cannot keep the text under the hard limit, token windows are used as a fallback. Breadcrumbs are prepended as a heading prefix such as \texttt{title > section}; this gives the reranker local section context without requiring a larger chunk.
+
+Boundary safety is rule-based. The chunker avoids flushing across a local boundary when the combined boundary window contains markers such as \texttt{not}, \texttt{unless}, \texttt{except}, \texttt{only if}, \texttt{provided that}, \texttt{cannot}, \texttt{before}, \texttt{after}, \texttt{must}, or \texttt{required}. The goal is not semantic reasoning; the goal is to avoid separating a claim from the qualifier that changes its meaning.
+
+The dataset adapters make the chunker exact enough for supervision:
 \begin{itemize}
-\item a BM25 lexical score;
-\item a frozen dense cosine-like similarity score;
-\item a risk prior for fragile evidence patterns such as numbers, dates, negations, and exception language.
+\item \textbf{HotpotQA:} every source sentence becomes a unit with breadcrumb equal to the article title. Metadata stores \texttt{title}, \texttt{title\_index}, \texttt{sent\_id}, and a \texttt{hotpot\_ref} key of the form \texttt{title::sent\_id}. A chunk is positive if any packed source unit's \texttt{hotpot\_ref} appears in the supporting-fact set.
+\item \textbf{QASPER:} the document is converted into abstract units, section-paragraph units, and figure/table-caption units. A chunk is positive when normalized highlighted evidence or evidence paragraphs appear in the chunk, or when a long evidence span has at least 0.72 token overlap.
+\item \textbf{LongBench:} records are paragraph chunked from the \texttt{context} field and kept evaluation-only because most tasks do not expose chunk-level evidence labels.
 \end{itemize}
 
-The ranked lists are fused with reciprocal-rank fusion and capped at $k=256$. On the validation slice used in this run, Recall@32, Recall@64, and Recall@128 were all 1.000 for every checkpoint evaluation. This indicates that Stage 1 was not the bottleneck on this slice; the harder problem was ordering and budgeted selection.
+\subsection{Stage-1 Candidate Generation}
+Stage 1 is designed for recall. It deliberately uses rank fusion instead of treating BM25, dense similarity, and risk scores as if they were calibrated to the same scale.
 
-\subsection{Cross-Encoder Reranking}
-The reranker is a ModernBERT-large cross-encoder over query-chunk pairs. Each input is packed as a pair sequence:
+BM25 tokenization uses the regex \verb|[A-Za-z0-9_.$%/-]+|; this preserves useful code-like and number-like tokens. Dense scoring has two interchangeable backends. The fast deterministic backend is a normalized hashing vectorizer with 4,096 features and character word-boundary n-grams of length 3 to 5. The semantic backend is a frozen sentence-transformer scorer using \texttt{BAAI/bge-small-en-v1.5}. Both return cosine-like scores.
+
+For every query and chunk list, the implementation computes raw BM25, raw dense, and raw risk scores, then min-max normalizes them within the query. A diagnostic hybrid score is stored:
+\[
+h_i = 0.45 \hat{b}_i + 0.45 \hat{d}_i + 0.10 \hat{r}_i.
+\]
+The actual candidate set is RRF fused from three top lists:
+\[
+C = \mathrm{RRF}(\mathrm{Top}_{96}^{BM25},\mathrm{Top}_{96}^{dense},\mathrm{Top}_{32}^{risk}),
+\]
+with
+\[
+\begin{aligned}
+\mathrm{RRF}(i)&=\sum_m \frac{\alpha_m}{60+\mathrm{rank}_m(i)},\\
+\alpha_{BM25}&=1.0,\quad \alpha_{dense}=1.0,\quad \alpha_{risk}=0.75.
+\end{aligned}
+\]
+The fused list is capped at 256 candidates. The candidate JSONL stores the ids, rank, source memberships, RRF score, raw component scores, normalized risk, hybrid score, token count, candidate recall, and whether all gold chunks were covered.
+
+\subsection{Fragile-Evidence Risk Prior}
+The risk prior is a cheap guard against dropping small facts that carry high semantic load. It is query-aware only through entity, heading, and numeric overlap; it is not a second neural model. The implemented risk score is:
+\[
+\begin{aligned}
+r_i ={}&2.0 f_{neg}+2.0 f_{exc}+1.5 f_{num}+1.5 f_{date}+1.5 f_{money}\\
+&+1.2 f_{cmp}+1.5 f_{code}+1.5 f_{table}+1.2 f_{eq}\\
+&+1.0 f_{entity}+1.0 f_{qnum}+0.5 f_{heading}.
+\end{aligned}
+\]
+The raw score is then min-max normalized within the query before being attached to candidates.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lp{0.55\linewidth}}
+\toprule
+Feature & Trigger\\
+\midrule
+\texttt{negation} & no, not, never, cannot, without\\
+\texttt{exception} & unless, except, only if, provided that\\
+\texttt{number/date} & numbers, percentages, years, month names\\
+\texttt{money} & currency symbols or USD/EUR/GBP values\\
+\texttt{comparison} & greater, less, before, after, minimum, first, later\\
+\texttt{code} & inline code, function calls, file paths\\
+\texttt{table/equation} & Markdown table rows, table metadata, equation symbols\\
+\texttt{overlap} & query entity, number, or heading overlap\\
+\bottomrule
+\end{tabular}
+\caption{Risk prior features used in Stage 1 and RiskGuard.}
+\label{tab:risk}
+\end{table}
+
+\subsection{ModernBERT-Large Cross-Encoder}
+The quality scorer is a cross-encoder, not a bi-encoder. For each candidate chunk $x_i$, the tokenizer first truncates the query to at most 96 tokens. The remaining budget is assigned to the chunk so that the final pair fits inside 512 tokens. The packed input is:
 \[
 \texttt{[CLS] query [SEP] chunk [SEP]}.
 \]
-The final hidden state at the first token is passed through a scalar classification head. The model is trained to output a high score for chunks containing gold supporting evidence.
-
-This design is more expensive than independent embedding retrieval, but it is appropriate for the quality path because the candidate pool is already capped. A cross-encoder can directly model interactions between the query and the chunk text, including relational clues that are hard to capture with independent embeddings.
-
-\subsection{Training Objective}
-The training objective combines binary evidence classification with a same-query pairwise margin loss. For each query group, positives are gold evidence chunks and negatives are high-ranked non-gold candidate chunks. The loss is:
+The model uses \texttt{answerdotai/ModernBERT-large} through Hugging Face \texttt{AutoModel} with \texttt{trust\_remote\_code=True}. In bf16 mode, the encoder is loaded with bfloat16 weights. The classifier is intentionally simple: final hidden state at position 0, dropout 0.1, then a one-dimensional linear layer:
 \[
-L = L_{\mathrm{BCE}} + \lambda L_{\mathrm{rank}},
+h_i = \mathrm{Enc}_{\theta}(q,x_i)_{0},\qquad s_i = w^\top \mathrm{Dropout}(h_i)+b.
 \]
-where $\lambda=0.5$ in the run. The margin loss encourages positive chunks to score above negative chunks from the same query group. This matters because compression quality depends on relative ordering under a budget, not only calibrated probabilities.
+At inference time, the logit is converted to $p_i=\sigma(s_i)$ and stored as \texttt{rerank\_prob}. The selected utility becomes the rerank probability, while the raw logit remains available for analysis. Checkpoints save the encoder, tokenizer, \texttt{classifier.pt}, and an \texttt{evidence\_codec\_reranker\_config.json} file, so evaluation can reload exactly the trained head and configuration.
+
+\subsection{Training Data and Objective}
+Training pairs are constructed from the chunk and candidate JSONL files. For each example, positives are candidate ids whose projected chunk label is 1. Negatives are the top non-gold Stage-1 candidates, keeping up to $\max(8,8\cdot |P|)$ negatives. Each example id receives a stable integer group id. Training microbatches are query groups, and gradient accumulation windows combine groups until the window reaches the requested effective batch size of 128 pairs.
+
+The loss is computed inside each optimizer step with microbatch weighting by pair count. This matters because query groups can have different numbers of positives and negatives. The objective is:
+\[
+L = 1.0 L_{\mathrm{BCE}} + 0.5 L_{\mathrm{rank}},
+\]
+where
+\[
+L_{\mathrm{rank}}=\frac{1}{|G|}\sum_{g \in G}\ \frac{1}{|P_g||N_g|}\sum_{p,n}\max(0,0.2-s_p+s_n).
+\]
+Groups without both a positive and a negative contribute zero ranking loss but still contribute BCE. The optimizer is AdamW with learning rate $2\cdot10^{-5}$, weight decay 0.01, linear warmup ratio 0.06, bf16 autocast on CUDA, and max gradient norm 1.0.
+
+The checkpoint trainer is resume-aware. If a previous checkpoint exists and overwrite is false, it reloads the latest checkpoint and trainer state. Checkpoint steps are generated by evenly dividing the total requested steps. For the completed 300-step time-boxed run with six checkpoints, the saved steps were 50, 100, 150, 200, 250, and 300.
 
 \subsection{Budgeted Selection and RiskGuard}
-After reranking, the selector chooses chunks under a token budget. The priority is approximately:
-\[
-\frac{\mathrm{utility}(x_i)}{\mathrm{tokens}(x_i)^\alpha},
-\]
-with $\alpha=0.9$. A small redundancy penalty reduces repeated content. The selected chunks are then sorted back into document order so the output remains readable.
+The selector receives candidates after reranking. In default serving configuration the total budget is 4,096 tokens. In the checkpoint evaluation reported here, the budget was 512 tokens to stress compression. The selector reserves 10 percent of the budget for risk add-back. Therefore, with a 512-token evaluation budget, the main selector sees 461 tokens and RiskGuard may spend up to 51 tokens.
 
-RiskGuard is a deterministic safety layer after budget selection. It can add back dropped chunks when both relevance and risk exceed thresholds. In the evaluation run, RiskGuard did not activate: avg risk-added chunks was 0.0 at all checkpoints. This does not invalidate the component; it means the HotpotQA validation slice did not trigger the configured add-back conditions. A separate stress evaluation is needed for dates, quantities, negations, and exception-heavy policy examples.
+The main selector greedily recomputes a priority after each selected chunk:
+\[
+\mathrm{priority}_i=
+\frac{\max(0,u_i-\eta\max_{j\in S}\mathrm{Jaccard}(x_i,x_j))}
+{\mathrm{tokens}(x_i)^{0.9}},
+\]
+with $\eta=0.15$. This is a practical approximation to utility maximization under a hard token budget. A chunk that would exceed the remaining budget is skipped. The Jaccard redundancy term uses lowercase alphanumeric content tokens and prevents near-duplicate chunks from consuming the budget.
+
+RiskGuard then examines the dropped candidates. A dropped chunk is eligible when:
+\[
+u_i \geq 0.35,\qquad \hat{r}_i \geq 0.55.
+\]
+Eligible chunks are sorted by normalized risk per token and added back only if they fit both the total budget and the add-back reserve. The final selected chunks are sorted back into document order before prompt assembly. This preserves readability and avoids presenting evidence in model-score order.
 
 \section{Engineering and Artifact Pipeline}
 The implementation was designed around Modal volumes and parallel jobs. Large datasets, processed artifacts, checkpoints, and evaluation outputs were not stored as local training data. They were stored in isolated Modal volumes:
 \begin{itemize}
-\item \texttt{/data} for raw and processed datasets;
-\item \texttt{/models} for ModernBERT checkpoints;
-\item \texttt{/runs} for evaluation metrics and plots;
-\item \texttt{/cache} for Hugging Face and model caches.
+\item \texttt{/data} for raw Arrow downloads, chunk JSONL, candidate JSONL, and shard outputs;
+\item \texttt{/models} for ModernBERT checkpoints and trainer state;
+\item \texttt{/runs} for checkpoint metrics, CSVs, JSONL logs, and plots;
+\item \texttt{/cache} for Hugging Face datasets, model weights, and transformer caches.
 \end{itemize}
 
-CPU preprocessing was parallelized across up to 100 containers. Each worker built a shard containing both chunk records and Stage-1 candidate records. This avoided a second pass over the full merged chunk file and allowed preprocessing to complete quickly enough for the challenge window.
+The Modal volume names were isolated under the \texttt{evidencecodec-ccalg-20260621} prefix so the run would not overwrite unrelated account volumes. Every writing function calls \texttt{commit\_all()}, and functions that read outputs from other containers call \texttt{reload\_all()} first. This matters for correctness when preprocessing, training, and evaluation run in separate containers.
 
-Training and checkpoint evaluation used B200 GPUs. The trainer saved six checkpoints at steps 50, 100, 150, 200, 250, and 300. After training, each checkpoint was evaluated and the metric curves were written to JSONL, CSV, and PNG plots.
+The full HotpotQA artifact builder uses 100 CPU containers. Each shard maps a contiguous row range from the raw Arrow files, chunks the example, projects labels, immediately builds the Stage-1 candidate record, writes paired shard JSONL files, and leaves a done marker. The merge step refuses to run until all shard done markers exist. This design avoids writing a huge chunk file and then launching a separate candidate-generation pass over it.
+
+The GPU path used only B200 instances. One B200 function trained ModernBERT-large with checkpoints. Evaluation used B200 workers with \texttt{max\_containers=8}; each worker reloaded a checkpoint, reranked the validation candidates, ran the selector at a 512-token budget, and returned metrics. A final Modal function wrote \texttt{metrics\_by\_checkpoint.jsonl}, \texttt{metrics\_by\_checkpoint.csv}, and one PNG per metric.
+
+\section{End-to-End Algorithms}
+This section states the exact online and offline algorithms implemented by the system. The deployed compressor does not call a teacher LLM, does not send hidden states to the final LLM, and does not perform abstractive rewriting. All neural computation is internal scoring over raw-text candidates.
+
+\subsection{Quality-Mode Compression}
+Given context $D$, query $q$, and token budget $B$, quality-mode compression runs:
+\begin{enumerate}
+\item Build deterministic chunks $X=\{x_1,\ldots,x_n\}$ with stable ids, token counts, breadcrumbs, and provenance metadata.
+\item Score every chunk with BM25, dense cosine-like similarity, and fragile-evidence risk.
+\item Form three top lists: lexical top 96, dense top 96, and risk top 32.
+\item Fuse the lists with weighted RRF and keep at most 256 candidates.
+\item Pack each $(q,x_i)$ pair for ModernBERT-large using a 96-token query cap and 512-token pair cap.
+\item Score candidates with the cross-encoder and convert logits to sigmoid probabilities.
+\item Run budgeted selection with a 10 percent RiskGuard reserve.
+\item Sort selected chunks back into original document order and join them with blank lines.
+\end{enumerate}
+
+The output is therefore:
+\[
+\begin{aligned}
+X &= \mathrm{Chunk}(D),\\
+K &= \mathrm{Stage1}(X,q),\\
+R &= \mathrm{Rerank}(K,q),\\
+C &= \mathrm{JoinByDocumentOrder}(\mathrm{Select}_B(R)).
+\end{aligned}
+\]
+The final prompt assembly is simple text assembly: \texttt{Context:} followed by selected raw chunks, then \texttt{Question:} followed by the query. This keeps the compressor model-agnostic: any downstream chat or completion model can consume the compressed context.
+
+\subsection{Fallback and Smoke-Test Modes}
+The same selector supports lower-cost modes. If \texttt{use\_reranker=False}, the pipeline skips ModernBERT and uses Stage-1 scores as candidate utility. If explicit candidate scores are supplied, \texttt{compress\_with\_scores} creates candidates directly from chunk ids and provided scores. These paths were useful for tests because they verify chunking, risk scoring, and budget behavior without GPU dependencies.
+
+The architecture also leaves room for the distilled student described in the project docs. The student was not necessary for the final time-boxed run, because the challenge objective was to prove the quality path first. The codebase still has a clean place for it: it can learn from saved cross-encoder scores and output the same candidate utility field consumed by the selector.
+
+\subsection{Training Artifact Construction}
+The training artifact algorithm is intentionally one-pass per shard:
+\begin{enumerate}
+\item Read a contiguous slice of HotpotQA Arrow rows from \texttt{/data/raw/hotpotqa/train}.
+\item Convert each row into HotpotQA sentence units with article-title breadcrumbs.
+\item Pack units into chunks with the shared chunking defaults.
+\item Project supporting facts onto chunks using \texttt{title::sent\_id} metadata.
+\item Run Stage 1 immediately for that record, producing a candidate record aligned with the chunk record.
+\item Write \texttt{chunks.part-xxxxx.jsonl}, \texttt{candidates.part-xxxxx.jsonl}, and a shard done marker.
+\end{enumerate}
+
+This is faster and safer than building all chunks first and then launching a second full pass. It also guarantees that every candidate record was built from the same chunk record emitted by that shard. The merge step concatenates shards in shard id order, so train and candidate JSONL files remain line-aligned.
+
+\subsection{Checkpoint Evaluation Algorithm}
+Each checkpoint evaluation repeats the actual compression path, not only the ranking metric path. For each validation example, the evaluator loads the saved checkpoint, reranks Stage-1 candidates, computes MRR and nDCG from the reranked order, runs the 512-token selector, and then computes evidence retention from selected ids. This matters because a checkpoint can have slightly better MRR but worse budgeted evidence recall. That is exactly what happened: step 250 had the best reranking metrics, while step 300 had the best compressed-context evidence metrics.
+
+\section{Artifact Contracts}
+The architecture is built around line-aligned JSONL contracts. These contracts made it possible to parallelize preprocessing, resume training, and evaluate checkpoints without hidden local state.
+
+\subsection{Chunk Record Contract}
+A chunk record represents one query/document example. It contains:
+\begin{itemize}
+\item \texttt{example\_id}, \texttt{dataset}, \texttt{split}, and optional subset metadata;
+\item \texttt{query} and answer strings when the dataset provides them;
+\item \texttt{chunks}, each with id, text, token count, breadcrumbs, and source-unit metadata;
+\item \texttt{labels}, aligned one-to-one with chunks when supervision exists;
+\item \texttt{gold\_chunk\_ids}, derived from labels;
+\item \texttt{gold\_evidence}, preserving original evidence references or spans;
+\item summary metadata such as positive chunk count and total chunk count.
+\end{itemize}
+
+For HotpotQA, label projection is exact at sentence level because the dataset exposes supporting fact titles and sentence ids. For QASPER, projection is necessarily overlap-based because evidence may be paragraph-level or highlighted text. That distinction is explicit in the data layer instead of hidden inside the model.
+
+\subsection{Candidate Record Contract}
+A candidate record is line-aligned with its chunk record. It stores \texttt{candidate\_ids}, detailed candidate score rows, ranked lists, and candidate recall diagnostics. Each candidate score row includes:
+\[
+\{\mathrm{rank},\mathrm{sources},\mathrm{RRF},\mathrm{BM25},\mathrm{dense},\mathrm{risk},\hat r,h_i,tokens\}.
+\]
+This makes Stage 1 auditable. If a gold chunk is missing, the failure is visible before training. If a risky chunk is present only because of the risk list, the \texttt{stage1\_sources} field shows that directly.
+
+\subsection{Reranker Pair Contract}
+Training examples are created lazily from chunk and candidate records. A pair contains \texttt{example\_id}, \texttt{chunk\_id}, query, chunk text, binary label, Stage-1 rank, and group id. The group id is the unit used by the pairwise margin loss. This makes negatives same-query negatives by construction, rather than random corpus negatives only.
+
+\subsection{Checkpoint Contract}
+Each saved checkpoint directory contains the ModernBERT encoder files, tokenizer files, \texttt{classifier.pt}, \texttt{trainer\_state.pt}, and the reranker config JSON. The trainer state stores optimizer, scheduler, current step, total steps, and reranker config. This is why the training function can resume instead of starting over when a Modal retry or timeout occurs.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{p{0.42\textwidth}p{0.50\textwidth}}
+\toprule
+Artifact path & Purpose\\
+\midrule
+\texttt{/data/processed/chunks/hotpotqa/}\newline\texttt{train.jsonl} & Full HotpotQA train chunk records, one line per example.\\
+\texttt{/data/processed/candidates/hotpotqa/}\newline\texttt{train.k256.jsonl} & Line-aligned Stage-1 train candidates capped at 256.\\
+\texttt{/data/processed/chunks/hotpotqa/}\newline\texttt{validation.sample1000.jsonl} & Validation chunk records for the time-boxed evaluation slice.\\
+\texttt{/data/processed/candidates/hotpotqa/}\newline\texttt{validation.sample1000.k256.jsonl} & Line-aligned validation candidate records.\\
+\texttt{/models/rerankers/}\newline\texttt{modernbert-large-hotpotqa-full/}\newline\texttt{checkpoint-step-*} & Six B200-trained ModernBERT-large reranker checkpoints.\\
+\texttt{/models/rerankers/}\newline\texttt{modernbert-large-hotpotqa-full/}\newline\texttt{training\_summary.json} & Pair count, optimizer steps, checkpoint list, and train log path.\\
+\texttt{/runs/evaluations/}\newline\texttt{modernbert-large-hotpotqa-full/}\newline\texttt{metrics\_by\_checkpoint.*} & Checkpoint metrics in JSONL and CSV form.\\
+\texttt{/runs/evaluations/}\newline\texttt{modernbert-large-hotpotqa-full/plots/*.png} & Metric curves used in this report.\\
+\bottomrule
+\end{tabular}
+\caption{Final Modal artifact contract. These paths are on Modal volumes, not local training-data directories.}
+\label{tab:artifacts}
+\end{table*}
+
+\section{Architecture Rationale}
+The main architectural choice is a multi-stage extractive compressor rather than a learned summarizer. That choice was made for three reasons. First, raw text keeps provenance visible: an evaluator can inspect exactly which evidence survived. Second, the final LLM receives normal text, so the compressor is not tied to one model provider or embedding interface. Third, supporting-fact datasets supervise evidence selection naturally; they do not directly supervise faithful abstractive compression.
+
+The chunker is deterministic because learned chunking would add training complexity without solving the bottleneck. A chunker only needs to preserve local coherence and not destroy evidence boundaries. Stage 1 is hybrid because no single cheap retriever is reliable enough: BM25 catches lexical matches, dense scoring catches paraphrase-like matches, and the risk list catches fragile facts that may not look semantically central. The cross-encoder is where semantic judgment belongs because it jointly attends over the query and candidate text. The selector is token-aware because a pure relevance ranker can waste budget on long, redundant chunks.
+
+This boundary also gives clear failure diagnosis. If gold evidence is absent from Stage 1, the issue is chunking, retrieval, or risk rescue. If gold evidence is present but ranked low, the issue is the reranker. If gold evidence is ranked high but missing after compression, the issue is selector budget, token accounting, or redundancy/risk thresholds. This separation was useful during the challenge because there was not enough time for broad end-to-end debugging.
 
 \section{Experimental Setup}
 Table~\ref{tab:setup} summarizes the completed run.
